@@ -12,10 +12,12 @@ const api = axios.create({
 
 api.interceptors.request.use(async (config) => {
   const user = auth.currentUser
+
   if (user) {
     const token = await user.getIdToken()
     config.headers.Authorization = `Bearer ${token}`
   }
+
   return config
 })
 
@@ -26,6 +28,7 @@ api.interceptors.response.use(
       auth.signOut()
       window.location.href = '/login'
     }
+
     return Promise.reject(error)
   }
 )
@@ -43,28 +46,44 @@ export const chatAPI = {
 export const fileAPI = {
   upload: (formData) =>
     api.post('/files/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
     }),
+
   list: () => api.get('/files'),
+
   delete: (fileId) => api.delete(`/files/${fileId}`),
 }
 
 export const voiceAPI = {
   transcribe: (formData) =>
     api.post('/voice/transcribe', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
     }),
+
   respond: (formData) =>
     api.post('/voice/respond', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
     }),
+
+  status: () => api.get('/voice/status'),
+
+  preload: () => api.post('/voice/preload'),
 }
 
 export const driveAPI = {
   getAuthUrl: () => api.get('/drive/auth-url'),
+
   callback: (code) => api.get(`/drive/callback?code=${code}`),
+
   listFiles: (accessToken, query = '') =>
     api.get(`/drive/files?access_token=${accessToken}&query=${encodeURIComponent(query)}`),
+
   importFile: (data) => api.post('/drive/import', data),
 }
 

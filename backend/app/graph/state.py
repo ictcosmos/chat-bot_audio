@@ -1,15 +1,20 @@
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 
-class ChatState(TypedDict):
+class ChatState(TypedDict, total=False):
     user_id: str
     chat_id: str
     message: str
     mode: str
     selected_file_ids: List[str]
 
+    # Current chat history from Firestore.
+    # Only messages from the same chat_id should be passed here.
+    history: List[Dict[str, Any]]
+
     route: str
     provider: str
+    reason: str
     model: str
 
     retrieved_chunks: List[Dict[str, Any]]

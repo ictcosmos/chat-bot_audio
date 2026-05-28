@@ -15,4 +15,9 @@ pandas
 langgraph
 langchain-core
 requests
-
+faster-whisper
+groq
+gTTS
+kokoro
+soundfile
+numpy

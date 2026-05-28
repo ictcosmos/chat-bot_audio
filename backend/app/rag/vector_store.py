@@ -8,92 +8,147 @@ _client = None
 
 def get_client():
     global _client
+
     if _client is None:
         _client = chromadb.PersistentClient(
             path=CHROMA_DIR,
             settings=Settings(anonymized_telemetry=False),
         )
+
     return _client
 
 
 def get_or_create_collection(collection_name: str = "documents"):
     client = get_client()
+
     try:
         return client.get_collection(collection_name)
-    except ValueError:
+    except Exception:
         return client.create_collection(collection_name)
 
 
+def _safe_metadata_value(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+
+def _make_unique_chunk_id(chunk: dict, index: int) -> str:
+    file_id = chunk.get("file_id", "file")
+    chunk_id = chunk.get("chunk_id", f"chunk_{index + 1:04d}")
+    return f"{file_id}_{chunk_id}"
+
+
 def add_chunks(chunks: list[dict], embeddings: list[list[float]]):
-    collection = get_or_create_collection()
-
-    ids = [c["chunk_id"] for c in chunks]
-    metadatas = [
-        {
-            "user_id": "",
-            "chat_id": "",
-            "file_id": c["file_id"],
-            "file_name": c["file_name"],
-            "page_start": c["page_start"],
-            "page_end": c["page_end"],
-            "section": c.get("section", ""),
-        }
-        for c in chunks
-    ]
-    texts = [c["text"] for c in chunks]
-
-    collection.add(
-        ids=ids,
+    return add_chunks_with_metadata(
+        chunks=chunks,
         embeddings=embeddings,
-        metadatas=metadatas,
-        documents=texts,
+        user_id="",
+        chat_id="",
     )
 
 
-def add_chunks_with_metadata(chunks: list[dict], embeddings: list[list[float]], user_id: str, chat_id: str):
+def add_chunks_with_metadata(
+    chunks: list[dict],
+    embeddings: list[list[float]],
+    user_id: str,
+    chat_id: str,
+):
     collection = get_or_create_collection()
 
-    ids = [c["chunk_id"] for c in chunks]
+    if not chunks:
+        return 0
+
+    if not embeddings:
+        return 0
+
+    if len(chunks) != len(embeddings):
+        raise ValueError(
+            f"Chunks and embeddings length mismatch: {len(chunks)} chunks, "
+            f"{len(embeddings)} embeddings"
+        )
+
+    ids = [_make_unique_chunk_id(chunk, index) for index, chunk in enumerate(chunks)]
+
     metadatas = [
         {
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "file_id": c["file_id"],
-            "file_name": c["file_name"],
-            "page_start": c["page_start"],
-            "page_end": c["page_end"],
-            "section": c.get("section", ""),
+            "user_id": _safe_metadata_value(user_id),
+            "chat_id": _safe_metadata_value(chat_id),
+            "file_id": _safe_metadata_value(chunk.get("file_id", "")),
+            "file_name": _safe_metadata_value(chunk.get("file_name", "")),
+            "page_start": _safe_metadata_value(chunk.get("page_start", 1)),
+            "page_end": _safe_metadata_value(chunk.get("page_end", 1)),
+            "section": _safe_metadata_value(chunk.get("section", "")),
         }
-        for c in chunks
+        for chunk in chunks
     ]
-    texts = [c["text"] for c in chunks]
+
+    documents = [chunk.get("text", "") for chunk in chunks]
 
     existing_ids = set()
+
     try:
         existing = collection.get(ids=ids)
         if existing and existing.get("ids"):
             existing_ids = set(existing["ids"])
     except Exception:
-        pass
+        existing_ids = set()
 
     new_ids = []
     new_embeddings = []
     new_metadatas = []
     new_documents = []
 
-    for i, cid in enumerate(ids):
-        if cid not in existing_ids:
-            new_ids.append(cid)
-            new_embeddings.append(embeddings[i])
-            new_metadatas.append(metadatas[i])
-            new_documents.append(texts[i])
+    for index, chunk_id in enumerate(ids):
+        if chunk_id in existing_ids:
+            continue
 
-    if new_ids:
-        collection.add(
-            ids=new_ids,
-            embeddings=new_embeddings,
-            metadatas=new_metadatas,
-            documents=new_documents,
+        doc_text = documents[index]
+
+        if not doc_text or not doc_text.strip():
+            continue
+
+        new_ids.append(chunk_id)
+        new_embeddings.append(embeddings[index])
+        new_metadatas.append(metadatas[index])
+        new_documents.append(doc_text)
+
+    if not new_ids:
+        return 0
+
+    collection.add(
+        ids=new_ids,
+        embeddings=new_embeddings,
+        metadatas=new_metadatas,
+        documents=new_documents,
+    )
+
+    return len(new_ids)
+
+
+def delete_file_chunks(file_id: str, user_id: str):
+    collection = get_or_create_collection()
+
+    try:
+        results = collection.get(
+            where={
+                "$and": [
+                    {"file_id": {"$eq": file_id}},
+                    {"user_id": {"$eq": user_id}},
+                ]
+            }
         )
-        return len(new_ids)
-    return 0
+
+        ids = results.get("ids", []) if results else []
+
+        if ids:
+            collection.delete(ids=ids)
+
+        return len(ids)
+
+    except Exception:
+        return 0

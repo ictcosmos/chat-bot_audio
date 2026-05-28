@@ -1,16 +1,16 @@
 from app.graph.state import ChatState
-from app.services.model_router import choose_route
-from app.services.groq_service import ask_groq_fast
+from app.rag.retrieval import retrieve_chunks
 from app.services.gemini_service import ask_gemini_search_grounded
+from app.services.groq_service import ask_groq_fast, ask_groq_for_rag
+from app.services.model_router import choose_route, is_latest_query
+from app.services.token_service import format_token_usage
 from app.services.trace_service import (
-    build_groq_chat_trace,
-    build_gemini_search_trace,
     build_document_rag_trace,
+    build_gemini_search_trace,
+    build_groq_chat_trace,
     build_hybrid_trace,
     build_voice_trace,
 )
-from app.services.token_service import format_token_usage
-from app.rag.retrieval import retrieve_chunks
 
 
 def auth_check_node(state: ChatState) -> dict:
@@ -20,9 +20,10 @@ def auth_check_node(state: ChatState) -> dict:
 def intent_router_node(state: ChatState) -> dict:
     route_info = choose_route(
         state.get("message", ""),
-        state.get("mode", "groq_chat"),
+        state.get("mode", "auto"),
         state.get("selected_file_ids"),
     )
+
     return {
         "route": route_info["route"],
         "provider": route_info["provider"],
@@ -31,8 +32,15 @@ def intent_router_node(state: ChatState) -> dict:
 
 
 def groq_chat_node(state: ChatState) -> dict:
-    result = ask_groq_fast(state.get("message", ""))
-    trace = build_groq_chat_trace(state.get("reason", "Default normal reasoning route"))
+    result = ask_groq_fast(
+        state.get("message", ""),
+        history=state.get("history", []),
+    )
+
+    trace = build_groq_chat_trace(
+        state.get("reason", "Default normal reasoning route")
+    )
+
     return {
         "answer": result["answer"],
         "token_usage": format_token_usage(result.get("token_usage")),
@@ -43,8 +51,15 @@ def groq_chat_node(state: ChatState) -> dict:
 
 
 def gemini_search_node(state: ChatState) -> dict:
-    result = ask_gemini_search_grounded(state.get("message", ""))
-    trace = build_gemini_search_trace(state.get("reason", "Latest/current information detected"))
+    result = ask_gemini_search_grounded(
+        state.get("message", ""),
+        history=state.get("history", []),
+    )
+
+    trace = build_gemini_search_trace(
+        state.get("reason", "Latest/current information detected")
+    )
+
     return {
         "answer": result["answer"],
         "token_usage": format_token_usage(result.get("token_usage")),
@@ -61,6 +76,7 @@ def document_retrieval_node(state: ChatState) -> dict:
         chat_id=state.get("chat_id", ""),
         selected_file_ids=state.get("selected_file_ids"),
     )
+
     return {
         "retrieved_chunks": chunks,
         "top_score": top_score,
@@ -75,6 +91,7 @@ def document_answer_node(state: ChatState) -> dict:
         sources = []
         trace = build_document_rag_trace(0, 0.0)
         token_info = format_token_usage(None)
+
         return {
             "answer": answer,
             "sources": sources,
@@ -84,8 +101,11 @@ def document_answer_node(state: ChatState) -> dict:
             "provider": "groq",
         }
 
-    from app.services.groq_service import ask_groq_for_rag
-    result = ask_groq_for_rag(state.get("message", ""), chunks)
+    result = ask_groq_for_rag(
+        state.get("message", ""),
+        chunks,
+        history=state.get("history", []),
+    )
 
     sources = [
         {
@@ -119,9 +139,15 @@ def hybrid_node(state: ChatState) -> dict:
         selected_file_ids=state.get("selected_file_ids"),
     )
 
+    history = state.get("history", [])
+
     if chunks:
-        from app.services.groq_service import ask_groq_for_rag
-        result = ask_groq_for_rag(state.get("message", ""), chunks)
+        result = ask_groq_for_rag(
+            state.get("message", ""),
+            chunks,
+            history=history,
+        )
+
         sources = [
             {
                 "file_name": c.get("file_name", ""),
@@ -131,8 +157,10 @@ def hybrid_node(state: ChatState) -> dict:
             }
             for c in chunks
         ]
+
         trace = build_hybrid_trace("document", len(chunks))
         token_info = format_token_usage(result.get("token_usage"))
+
         return {
             "answer": result["answer"],
             "sources": sources,
@@ -144,12 +172,16 @@ def hybrid_node(state: ChatState) -> dict:
 
     header = "No related information was found in the uploaded document.\n\nGeneral answer:\n"
 
-    from app.services.model_router import is_latest_query
     if is_latest_query(state.get("message", "")):
-        result = ask_gemini_search_grounded(state.get("message", ""))
+        result = ask_gemini_search_grounded(
+            state.get("message", ""),
+            history=history,
+        )
+
         trace = build_hybrid_trace("gemini_search_fallback", 0)
         trace["reason"] = "No document context found, fell back to Gemini Search"
         token_info = format_token_usage(result.get("token_usage"))
+
         return {
             "answer": header + result["answer"],
             "sources": [],
@@ -159,10 +191,15 @@ def hybrid_node(state: ChatState) -> dict:
             "provider": "gemini",
         }
 
-    result = ask_groq_fast(state.get("message", ""))
+    result = ask_groq_fast(
+        state.get("message", ""),
+        history=history,
+    )
+
     trace = build_hybrid_trace("groq_fallback", 0)
     trace["reason"] = "No document context found, fell back to Groq"
     token_info = format_token_usage(result.get("token_usage"))
+
     return {
         "answer": header + result["answer"],
         "sources": [],
@@ -176,12 +213,13 @@ def hybrid_node(state: ChatState) -> dict:
 def voice_node(state: ChatState) -> dict:
     trace = build_voice_trace()
     token_info = format_token_usage(None)
+
     return {
         "answer": state.get("message", ""),
         "trace": trace,
         "token_usage": token_info,
-        "model": "gemini-2.5-flash",
-        "provider": "gemini",
+        "model": "voice-pipeline",
+        "provider": "voice",
     }
 
 
