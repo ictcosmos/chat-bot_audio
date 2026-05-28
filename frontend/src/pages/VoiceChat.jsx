@@ -2,37 +2,52 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft,
-  Languages,
   Loader2,
   Mic,
-  Square,
+  PhoneOff,
   Volume2,
   AlertCircle,
   Cpu,
+  User,
+  Sparkles,
 } from 'lucide-react'
 import { chatAPI, voiceAPI } from '../services/api'
 
 export default function VoiceChat({ user }) {
   const navigate = useNavigate()
 
+  const [sessionActive, setSessionActive] = useState(false)
   const [status, setStatus] = useState('idle')
-  const [transcript, setTranscript] = useState('')
-  const [answer, setAnswer] = useState('')
-  const [language, setLanguage] = useState('auto')
+  const [turns, setTurns] = useState([])
+  const [error, setError] = useState('')
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [chatId, setChatId] = useState(() => localStorage.getItem('voiceChatId') || '')
-  const [error, setError] = useState('')
-  const [ttsProvider, setTtsProvider] = useState('')
-  const [sttModel, setSttModel] = useState('')
   const [modelStatus, setModelStatus] = useState(null)
   const [modelMessage, setModelMessage] = useState('')
-  const [preloading, setPreloading] = useState(false)
+
+  const streamRef = useRef(null)
+  const audioContextRef = useRef(null)
+  const analyserRef = useRef(null)
+  const monitorFrameRef = useRef(null)
 
   const mediaRecorderRef = useRef(null)
   const chunksRef = useRef([])
-  const streamRef = useRef(null)
-  const processingRef = useRef(false)
   const audioRef = useRef(null)
+
+  const sessionActiveRef = useRef(false)
+  const isRecordingRef = useRef(false)
+  const isSpeakingRef = useRef(false)
+  const processingRef = useRef(false)
+  const speechStartedRef = useRef(false)
+  const silenceStartedAtRef = useRef(null)
+  const turnStartAtRef = useRef(null)
+
+  const volumeThresholdRef = useRef(0.065)
+  const interruptThresholdRef = useRef(0.09)
+  const interruptHoldMsRef = useRef(450)
+  const silenceMsRef = useRef(1200)
+  const maxTurnMsRef = useRef(22000)
+  const interruptStartedAtRef = useRef(null)
 
   const checkVoiceModelStatus = useCallback(async () => {
     try {
@@ -41,18 +56,18 @@ export default function VoiceChat({ user }) {
 
       setModelStatus(data)
 
-      if (data.whisper_loaded && data.kokoro_loaded) {
+      if (data.silero_loaded && data.whisper_loaded && data.kokoro_loaded) {
         setModelMessage(
-          `Voice models loaded. STT: ${data.whisper_model}. English TTS: Kokoro ready.`
+          `Voice models ready. VAD: Silero, STT: ${data.whisper_model}, TTS: Kokoro/gTTS.`
         )
-      } else if (data.whisper_loaded && !data.kokoro_loaded) {
+      } else if (data.silero_loading || data.whisper_loading || data.kokoro_loading) {
+        setModelMessage('Voice models are loading in the background...')
+      } else if (data.silero_loaded && data.whisper_loaded) {
         setModelMessage(
-          `Whisper loaded: ${data.whisper_model}. Kokoro will load when English TTS is needed.`
+          `Silero and Whisper ready. Kokoro loads when English TTS is needed.`
         )
       } else {
-        setModelMessage(
-          `Voice model not loaded yet. First request will load ${data.whisper_model || 'Whisper'}.`
-        )
+        setModelMessage('Voice models are not fully loaded yet. First run may take time.')
       }
 
       return data
@@ -66,22 +81,13 @@ export default function VoiceChat({ user }) {
   useEffect(() => {
     checkVoiceModelStatus()
 
+    const interval = setInterval(() => {
+      checkVoiceModelStatus()
+    }, 5000)
+
     return () => {
-      if (
-        mediaRecorderRef.current &&
-        mediaRecorderRef.current.state !== 'inactive'
-      ) {
-        mediaRecorderRef.current.stop()
-      }
-
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop())
-      }
-
-      if (audioRef.current) {
-        audioRef.current.pause()
-        audioRef.current.src = ''
-      }
+      clearInterval(interval)
+      endVoiceSession(false)
     }
   }, [checkVoiceModelStatus])
 
@@ -100,50 +106,187 @@ export default function VoiceChat({ user }) {
     return newChatId
   }
 
-  const preloadModels = async () => {
-    if (preloading) return
+  const getVolume = () => {
+    const analyser = analyserRef.current
+    if (!analyser) return 0
 
-    setPreloading(true)
-    setError('')
-    setModelMessage('Loading voice models now. This may take time on the first run...')
+    const data = new Uint8Array(analyser.fftSize)
+    analyser.getByteTimeDomainData(data)
 
-    try {
-      const response = await voiceAPI.preload()
-      const data = response.data || {}
+    let sum = 0
 
-      setModelStatus(data)
+    for (let i = 0; i < data.length; i++) {
+      const value = (data[i] - 128) / 128
+      sum += value * value
+    }
 
-      if (data.whisper_loaded && data.kokoro_loaded) {
-        setModelMessage(
-          `Voice models loaded. STT: ${data.whisper_model}. Kokoro: loaded.`
-        )
-      } else if (data.whisper_loaded) {
-        setModelMessage(
-          `Whisper loaded: ${data.whisper_model}. Kokoro is not loaded yet.`
-        )
-      } else {
-        setModelMessage('Voice model preload finished, but Whisper is still not loaded.')
+    return Math.sqrt(sum / data.length)
+  }
+
+  const setupAudioMonitor = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
+
+    streamRef.current = stream
+
+    const AudioContext = window.AudioContext || window.webkitAudioContext
+    const audioContext = new AudioContext()
+    const source = audioContext.createMediaStreamSource(stream)
+    const analyser = audioContext.createAnalyser()
+
+    analyser.fftSize = 1024
+    source.connect(analyser)
+
+    audioContextRef.current = audioContext
+    analyserRef.current = analyser
+  }
+
+  const startMonitoring = () => {
+    const monitor = () => {
+      if (!sessionActiveRef.current) return
+
+      const volume = getVolume()
+      const now = Date.now()
+      const isUserSpeaking = volume > volumeThresholdRef.current
+
+      if (isSpeakingRef.current) {
+        const isStrongUserSpeech = volume > interruptThresholdRef.current
+
+        if (isStrongUserSpeech) {
+          if (!interruptStartedAtRef.current) {
+            interruptStartedAtRef.current = now
+          }
+
+          if (now - interruptStartedAtRef.current >= interruptHoldMsRef.current) {
+            stopAssistantAudio()
+            interruptStartedAtRef.current = null
+            startRecordingTurn()
+          }
+        } else {
+          interruptStartedAtRef.current = null
+        }
       }
-    } catch (err) {
-      console.error('Voice model preload failed:', err)
 
-      const detail = err.response?.data?.detail
-      const message =
-        typeof detail === 'string'
-          ? detail
-          : detail
-            ? JSON.stringify(detail, null, 2)
-            : err.message || 'Failed to preload voice models.'
+      if (isRecordingRef.current) {
+        if (isUserSpeaking) {
+          speechStartedRef.current = true
+          silenceStartedAtRef.current = null
+        } else if (speechStartedRef.current) {
+          if (!silenceStartedAtRef.current) {
+            silenceStartedAtRef.current = now
+          }
 
-      setModelMessage(message)
-    } finally {
-      setPreloading(false)
-      await checkVoiceModelStatus()
+          if (now - silenceStartedAtRef.current >= silenceMsRef.current) {
+            stopRecordingTurn()
+          }
+        }
+
+        if (turnStartAtRef.current && now - turnStartAtRef.current >= maxTurnMsRef.current) {
+          stopRecordingTurn()
+        }
+      }
+
+      monitorFrameRef.current = requestAnimationFrame(monitor)
+    }
+
+    monitorFrameRef.current = requestAnimationFrame(monitor)
+  }
+
+  const stopMonitoring = () => {
+    if (monitorFrameRef.current) {
+      cancelAnimationFrame(monitorFrameRef.current)
+      monitorFrameRef.current = null
+    }
+  }
+
+  const startRecordingTurn = () => {
+    if (!sessionActiveRef.current) return
+    if (isRecordingRef.current) return
+    if (processingRef.current) return
+    if (isSpeakingRef.current) return
+
+    const stream = streamRef.current
+
+    if (!stream) return
+
+    let options = {}
+
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      options = { mimeType: 'audio/webm;codecs=opus' }
+    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+      options = { mimeType: 'audio/webm' }
+    }
+
+    const mediaRecorder = new MediaRecorder(stream, options)
+
+    mediaRecorderRef.current = mediaRecorder
+    chunksRef.current = []
+    speechStartedRef.current = false
+    silenceStartedAtRef.current = null
+    turnStartAtRef.current = Date.now()
+
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        chunksRef.current.push(event.data)
+      }
+    }
+
+    mediaRecorder.onstop = async () => {
+      isRecordingRef.current = false
+
+      const mimeType = mediaRecorder.mimeType || 'audio/webm'
+      const blob = new Blob(chunksRef.current, { type: mimeType })
+
+      if (!sessionActiveRef.current) return
+
+      if (blob.size === 0) {
+        startRecordingTurn()
+        return
+      }
+
+      await processAudioTurn(blob)
+
+      if (sessionActiveRef.current && !isSpeakingRef.current && !processingRef.current) {
+        startRecordingTurn()
+      }
+    }
+
+    isRecordingRef.current = true
+    setStatus('listening')
+    mediaRecorder.start()
+  }
+
+  const stopRecordingTurn = () => {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== 'inactive'
+    ) {
+      mediaRecorderRef.current.stop()
+    }
+  }
+
+  const stopAssistantAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.src = ''
+    }
+
+    interruptStartedAtRef.current = null
+    isSpeakingRef.current = false
+    setIsSpeaking(false)
+
+    if (sessionActiveRef.current) {
+      setStatus('listening')
     }
   }
 
   const playBackendAudio = async (audioBase64, mimeType) => {
-    if (!audioBase64 || !mimeType) return
+    if (!audioBase64 || !mimeType || !sessionActiveRef.current) return
 
     if (audioRef.current) {
       audioRef.current.pause()
@@ -155,173 +298,155 @@ export default function VoiceChat({ user }) {
 
     audioRef.current = audio
 
-    audio.onplay = () => setIsSpeaking(true)
+    audio.onplay = () => {
+      isSpeakingRef.current = true
+      setIsSpeaking(true)
+      setStatus('speaking')
+    }
 
     audio.onended = () => {
+      isSpeakingRef.current = false
       setIsSpeaking(false)
+
+      if (sessionActiveRef.current) {
+        setStatus('listening')
+        startRecordingTurn()
+      }
     }
 
     audio.onerror = () => {
+      isSpeakingRef.current = false
       setIsSpeaking(false)
+
+      if (sessionActiveRef.current) {
+        setStatus('listening')
+        startRecordingTurn()
+      }
     }
 
     await audio.play()
   }
 
-  const processAudio = async (blob) => {
+  const processAudioTurn = async (blob) => {
     if (processingRef.current) return
 
     processingRef.current = true
     setStatus('processing')
     setError('')
 
-    if (!modelStatus?.whisper_loaded) {
-      setModelMessage('Loading faster-whisper model. First request may take time...')
-    } else {
-      setModelMessage('Voice model loaded. Processing your audio...')
-    }
-
     try {
       const realChatId = await ensureVoiceChat()
 
       const formData = new FormData()
-      formData.append('audio', blob, 'recording.webm')
+      formData.append('audio', blob, 'voice-turn.webm')
       formData.append('chat_id', realChatId)
 
       const response = await voiceAPI.transcribe(formData)
       const data = response.data || {}
 
-      setModelMessage('Model loaded. Generating and playing response...')
       await checkVoiceModelStatus()
 
-      const detectedTranscript = data.transcript || ''
-      const detectedAnswer = data.answer || ''
+      if (data.no_speech) {
+        processingRef.current = false
 
-      setTranscript(detectedTranscript)
-      setAnswer(detectedAnswer)
-      setTtsProvider(data.tts_provider || '')
-      setSttModel(data.stt_model || '')
+        if (sessionActiveRef.current) {
+          setStatus('listening')
+        }
+
+        return
+      }
+
+      const userText = data.transcript || ''
+      const assistantText = data.answer || ''
 
       if (data.chat_id) {
         setChatId(data.chat_id)
         localStorage.setItem('voiceChatId', data.chat_id)
       }
 
-      setStatus('done')
+      if (userText || assistantText) {
+        setTurns((prev) => [
+          ...prev,
+          {
+            id: Date.now(),
+            user: userText,
+            assistant: assistantText,
+            provider: data.provider || '',
+            model: data.model || '',
+            ttsProvider: data.tts_provider || '',
+            language: data.language || '',
+          },
+        ])
+      }
 
-      if (data.audio_base64 && data.audio_mime_type) {
+      processingRef.current = false
+
+      if (sessionActiveRef.current && data.audio_base64 && data.audio_mime_type) {
         await playBackendAudio(data.audio_base64, data.audio_mime_type)
+      } else if (sessionActiveRef.current) {
+        setStatus('listening')
+        startRecordingTurn()
       }
     } catch (err) {
       console.error('Voice processing failed:', err)
 
       const detail = err.response?.data?.detail
-      let errorText = 'Voice processing failed.'
 
-      if (typeof detail === 'string') {
-        errorText = detail
-      } else if (detail) {
-        errorText = JSON.stringify(detail, null, 2)
-      } else if (err.message) {
-        errorText = err.message
-      }
+      const errorText =
+        typeof detail === 'string'
+          ? detail
+          : detail
+            ? JSON.stringify(detail, null, 2)
+            : err.message || 'Voice processing failed.'
 
       setError(errorText)
       setStatus('error')
-    } finally {
       processingRef.current = false
     }
   }
 
-  const startRecording = useCallback(async () => {
+  const startVoiceSession = async () => {
+    if (sessionActiveRef.current) return
+
     try {
-      if (audioRef.current) {
-        audioRef.current.pause()
-        audioRef.current.src = ''
-      }
-
-      setTranscript('')
-      setAnswer('')
       setError('')
-      setTtsProvider('')
-      setSttModel('')
+      setTurns([])
+      setStatus('preparing')
+      setSessionActive(true)
+      sessionActiveRef.current = true
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      streamRef.current = stream
+      await ensureVoiceChat()
+      await setupAudioMonitor()
+      await checkVoiceModelStatus()
 
-      let options = {}
-
-      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-        options = { mimeType: 'audio/webm;codecs=opus' }
-      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-        options = { mimeType: 'audio/webm' }
-      }
-
-      const mediaRecorder = new MediaRecorder(stream, options)
-
-      mediaRecorderRef.current = mediaRecorder
-      chunksRef.current = []
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          chunksRef.current.push(event.data)
-        }
-      }
-
-      mediaRecorder.onstop = async () => {
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((track) => track.stop())
-          streamRef.current = null
-        }
-
-        const mimeType = mediaRecorder.mimeType || 'audio/webm'
-        const blob = new Blob(chunksRef.current, { type: mimeType })
-
-        if (blob.size === 0) {
-          setError('No audio was recorded. Please try again.')
-          setStatus('error')
-          return
-        }
-
-        await processAudio(blob)
-      }
-
-      mediaRecorder.start()
       setStatus('listening')
+      startMonitoring()
+      startRecordingTurn()
     } catch (err) {
-      console.error('Failed to start recording:', err)
-      setError(
-        err.message ||
-        'Could not access microphone. Please allow microphone permission.'
-      )
+      console.error('Failed to start voice session:', err)
+      setError(err.message || 'Could not start voice session.')
       setStatus('error')
+      sessionActiveRef.current = false
+      setSessionActive(false)
     }
-  }, [chatId, modelStatus])
-
-  const stopRecording = useCallback(() => {
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== 'inactive'
-    ) {
-      mediaRecorderRef.current.stop()
-    }
-  }, [])
-
-  const handleMicClick = () => {
-    if (status === 'listening') {
-      stopRecording()
-      return
-    }
-
-    startRecording()
   }
 
-  const stopEverything = () => {
+  const endVoiceSession = (goBack = true) => {
+    sessionActiveRef.current = false
+    setSessionActive(false)
+
+    stopMonitoring()
+    stopAssistantAudio()
+
     if (
       mediaRecorderRef.current &&
       mediaRecorderRef.current.state !== 'inactive'
     ) {
-      mediaRecorderRef.current.stop()
+      try {
+        mediaRecorderRef.current.stop()
+      } catch {
+        // ignore
+      }
     }
 
     if (streamRef.current) {
@@ -329,238 +454,239 @@ export default function VoiceChat({ user }) {
       streamRef.current = null
     }
 
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current.src = ''
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => { })
+      audioContextRef.current = null
     }
+
+    analyserRef.current = null
+    isRecordingRef.current = false
+    processingRef.current = false
+    speechStartedRef.current = false
+    silenceStartedAtRef.current = null
+    turnStartAtRef.current = null
 
     setIsSpeaking(false)
     setStatus('idle')
-  }
 
-  const cycleLanguage = () => {
-    const langs = {
-      auto: 'ne',
-      ne: 'en',
-      en: 'auto',
+    if (goBack) {
+      navigate('/')
     }
-
-    setLanguage((prev) => langs[prev])
   }
 
-  const languageLabel =
-    language === 'auto' ? 'Auto' : language === 'ne' ? 'Nepali' : 'English'
+  const statusText = {
+    idle: 'Press the mic once to start a continuous voice chat.',
+    preparing: 'Preparing microphone and voice models...',
+    listening: 'Listening. Ask your question naturally.',
+    processing: 'Thinking and generating response...',
+    speaking: 'AI is speaking. Start talking to interrupt.',
+    error: 'Something went wrong.',
+  }[status]
 
+  const sileroLoaded = Boolean(modelStatus?.silero_loaded)
   const whisperLoaded = Boolean(modelStatus?.whisper_loaded)
   const kokoroLoaded = Boolean(modelStatus?.kokoro_loaded)
 
+  const StatusPill = ({ label, loaded }) => (
+    <span
+      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${loaded
+        ? 'bg-green-100 text-green-700 dark:bg-green-950/30 dark:text-green-400'
+        : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-950/30 dark:text-yellow-400'
+        }`}
+    >
+      <span
+        className={`w-1.5 h-1.5 rounded-full ${loaded ? 'bg-green-500' : 'bg-yellow-500'
+          }`}
+      />
+      {label}: {loaded ? 'loaded' : 'not loaded'}
+    </span>
+  )
+
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] flex flex-col">
-      <header className="border-b border-[var(--border-color)] bg-[var(--bg-secondary)] px-5 py-4 flex items-center justify-between">
+      {/* Header */}
+      <header className="border-b border-[var(--border-color)] bg-[var(--bg-secondary)]/80 backdrop-blur-sm px-4 sm:px-5 py-3.5 flex items-center justify-between sticky top-0 z-10">
         <button
           type="button"
-          onClick={() => navigate('/')}
-          className="flex items-center gap-2 text-[var(--text-primary)] hover:text-[var(--accent)] transition-colors"
+          onClick={() => endVoiceSession(true)}
+          className="flex items-center gap-2 text-sm text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)] rounded-lg px-2 py-1 -ml-2"
         >
           <ArrowLeft size={18} />
-          Back to Chat
+          <span className="hidden sm:inline">Back to Chat</span>
         </button>
+
+        <h1 className="text-sm font-semibold text-[var(--text-primary)]">Voice Chat</h1>
 
         <button
           type="button"
-          onClick={cycleLanguage}
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
-          title="Language is detected automatically by faster-whisper. This button is only visual for now."
+          onClick={() => endVoiceSession(true)}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors focus:outline-none focus:ring-2 focus:ring-red-400"
         >
-          <Languages size={16} />
-          {languageLabel}
+          <PhoneOff size={16} />
+          <span className="hidden sm:inline">End</span>
         </button>
       </header>
 
-      <main className="flex-1 flex flex-col items-center justify-center px-5 py-8">
-        <div className="w-full max-w-2xl text-center">
-          <div className="mb-6 rounded-2xl border border-[var(--border-color)] bg-[var(--bg-secondary)] p-4 text-left shadow-sm">
-            <div className="flex items-center gap-2 mb-2">
-              <Cpu size={18} className="text-[var(--accent)]" />
-              <h2 className="font-semibold text-sm">Voice model status</h2>
+      <main className="flex-1 flex flex-col items-center px-4 sm:px-5 py-6 sm:py-8">
+        <div className="w-full max-w-3xl">
+          {/* Model status card */}
+          <div className="mb-6 rounded-2xl border border-[var(--border-color)] bg-[var(--bg-secondary)] p-4 sm:p-5 shadow-sm">
+            <div className="flex items-center gap-2 mb-2.5">
+              <span className="w-8 h-8 rounded-lg bg-[var(--accent)]/10 flex items-center justify-center text-[var(--accent)]">
+                <Cpu size={16} />
+              </span>
+              <h2 className="font-semibold text-sm">Continuous voice chat</h2>
             </div>
 
             <p className="text-sm text-[var(--text-secondary)]">
               {modelMessage || 'Checking voice model status...'}
             </p>
 
-            <div className="mt-3 flex flex-wrap gap-2 text-xs">
-              <span
-                className={`px-3 py-1 rounded-full ${whisperLoaded
-                    ? 'bg-green-100 text-green-700 dark:bg-green-950/30 dark:text-green-400'
-                    : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-950/30 dark:text-yellow-400'
-                  }`}
-              >
-                Whisper: {whisperLoaded ? 'loaded' : 'not loaded'}
-              </span>
-
-              <span
-                className={`px-3 py-1 rounded-full ${kokoroLoaded
-                    ? 'bg-green-100 text-green-700 dark:bg-green-950/30 dark:text-green-400'
-                    : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-950/30 dark:text-yellow-400'
-                  }`}
-              >
-                Kokoro: {kokoroLoaded ? 'loaded' : 'not loaded'}
-              </span>
+            <div className="mt-3.5 flex flex-wrap gap-2">
+              <StatusPill label="Silero" loaded={sileroLoaded} />
+              <StatusPill label="Whisper" loaded={whisperLoaded} />
+              <StatusPill label="Kokoro" loaded={kokoroLoaded} />
             </div>
 
-            <button
-              type="button"
-              onClick={preloadModels}
-              disabled={preloading || status === 'listening' || status === 'processing'}
-              className="mt-4 px-4 py-2 rounded-lg text-sm bg-[var(--bg-tertiary)] hover:bg-[var(--accent)] hover:text-white transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {preloading ? 'Loading models...' : 'Preload Voice Models'}
-            </button>
+            <p className="text-xs text-[var(--text-secondary)] mt-3.5 leading-relaxed">
+              Backend VAD: Silero. STT: faster-whisper. LLM: Groq/Gemini Search. TTS: gTTS/Kokoro.
+            </p>
           </div>
 
-          {status === 'idle' && (
-            <>
-              <h1 className="text-3xl font-bold mb-3">Voice Chat</h1>
-              <p className="text-[var(--text-secondary)]">
-                Tap the mic, speak naturally, then tap again to stop.
-              </p>
-              <p className="text-sm text-[var(--text-secondary)] mt-2">
-                faster-whisper large-v3 → Groq LLM → gTTS/Kokoro voice.
-              </p>
-            </>
-          )}
-
-          {status === 'listening' && (
-            <>
-              <h1 className="text-3xl font-bold mb-3">Listening...</h1>
-              <p className="text-[var(--text-secondary)]">
-                Speak now. Tap the button again when you finish.
-              </p>
-            </>
-          )}
-
-          {status === 'processing' && (
-            <>
-              <Loader2
-                size={40}
-                className="animate-spin mx-auto mb-4 text-[var(--accent)]"
-              />
-              <h1 className="text-3xl font-bold mb-3">Processing...</h1>
-              <p className="text-[var(--text-secondary)]">
-                Transcribing with faster-whisper and answering with Groq.
-              </p>
-              {modelMessage && (
-                <p className="text-sm text-[var(--accent)] mt-3">
-                  {modelMessage}
-                </p>
-              )}
-              <p className="text-xs text-[var(--text-secondary)] mt-2">
-                First run may be slow because the Whisper model loads.
-              </p>
-            </>
-          )}
-
-          {status === 'done' && (
-            <div className="text-left rounded-2xl border border-[var(--border-color)] bg-[var(--bg-secondary)] p-5 shadow-sm">
-              {modelMessage && (
-                <div className="mb-4 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] px-3 py-2 text-xs text-[var(--text-secondary)]">
-                  {modelMessage}
-                </div>
+          {/* Mic orb */}
+          <div className="text-center py-4">
+            <div className="relative inline-flex items-center justify-center">
+              {/* Pulsing rings when active */}
+              {sessionActive && (
+                <>
+                  <span className="absolute inline-flex h-28 w-28 rounded-full bg-[var(--accent)]/20 animate-ping" />
+                  <span
+                    className={`absolute inline-flex rounded-full transition-all duration-500 ${isSpeaking
+                      ? 'h-36 w-36 bg-[var(--accent)]/10'
+                      : 'h-32 w-32 bg-[var(--accent)]/10'
+                      }`}
+                  />
+                </>
               )}
 
-              {isSpeaking && (
-                <div className="flex items-center gap-2 text-sm text-[var(--accent)] mb-3">
-                  <Volume2 size={16} />
-                  Speaking...
-                </div>
-              )}
-
-              <p className="text-xs uppercase tracking-wide text-[var(--text-secondary)] mb-1">
-                You said
-              </p>
-              <p className="text-[var(--text-primary)] mb-4">
-                {transcript || 'Transcript unavailable.'}
-              </p>
-
-              <p className="text-xs uppercase tracking-wide text-[var(--text-secondary)] mb-1">
-                Assistant
-              </p>
-              <p className="text-[var(--text-primary)] whitespace-pre-wrap">
-                {answer || 'No answer returned.'}
-              </p>
-
-              <div className="mt-4 text-xs text-[var(--text-secondary)]">
-                {sttModel && <p>STT: {sttModel}</p>}
-                {ttsProvider && <p>TTS: {ttsProvider}</p>}
-              </div>
-            </div>
-          )}
-
-          {status === 'error' && (
-            <div className="rounded-2xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/20 p-5">
-              <div className="flex items-center justify-center gap-2 text-red-500 mb-2">
-                <AlertCircle size={22} />
-                <h1 className="text-2xl font-bold">Something went wrong</h1>
-              </div>
-              <p className="text-sm text-red-500 whitespace-pre-wrap">
-                {error || 'Please try again.'}
-              </p>
-            </div>
-          )}
-
-          <div className="mt-10 flex flex-col items-center gap-4">
-            <button
-              type="button"
-              onClick={handleMicClick}
-              disabled={status === 'processing' || preloading}
-              className={`w-24 h-24 rounded-full flex items-center justify-center shadow-lg transition-all ${status === 'listening'
-                  ? 'bg-red-500 text-white animate-pulse'
-                  : 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]'
-                } disabled:opacity-60 disabled:cursor-not-allowed`}
-            >
-              {status === 'processing' ? (
-                <Loader2 size={34} className="animate-spin" />
-              ) : status === 'listening' ? (
-                <Square size={34} />
-              ) : (
-                <Mic size={38} />
-              )}
-            </button>
-
-            {status === 'listening' && (
-              <p className="text-sm text-[var(--text-secondary)]">
-                Tap again to stop recording.
-              </p>
-            )}
-
-            {(status === 'listening' ||
-              status === 'processing' ||
-              isSpeaking) && (
-                <button
-                  type="button"
-                  onClick={stopEverything}
-                  className="px-4 py-2 rounded-lg text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors"
-                >
-                  Stop
-                </button>
-              )}
-
-            {status === 'done' && (
               <button
                 type="button"
-                onClick={() => {
-                  setTranscript('')
-                  setAnswer('')
-                  setError('')
-                  setTtsProvider('')
-                  setSttModel('')
-                  setStatus('idle')
-                }}
-                className="px-4 py-2 rounded-lg text-sm bg-[var(--bg-tertiary)] hover:bg-[var(--accent)] hover:text-white transition-colors"
+                onClick={sessionActive ? () => endVoiceSession(false) : startVoiceSession}
+                className={`relative w-28 h-28 rounded-full flex items-center justify-center shadow-lg transition-all focus:outline-none focus:ring-4 focus:ring-[var(--accent)]/30 ${sessionActive
+                  ? 'bg-red-500 text-white hover:bg-red-600'
+                  : 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] hover:scale-105'
+                  }`}
+                aria-label={sessionActive ? 'End voice chat' : 'Start voice chat'}
               >
-                Speak Again
+                {status === 'preparing' || status === 'processing' ? (
+                  <Loader2 size={38} className="animate-spin" />
+                ) : sessionActive ? (
+                  <PhoneOff size={38} />
+                ) : (
+                  <Mic size={42} />
+                )}
               </button>
+            </div>
+
+            <h2 className="text-2xl font-bold mt-6">
+              {sessionActive ? 'Voice chat running' : 'Start voice chat'}
+            </h2>
+
+            <p className="text-[var(--text-secondary)] mt-2 max-w-md mx-auto">
+              {statusText}
+            </p>
+
+            {isSpeaking && (
+              <div className="mt-3 inline-flex items-center gap-2 text-sm text-[var(--accent)] bg-[var(--accent)]/10 px-3 py-1.5 rounded-full">
+                <Volume2 size={16} />
+                Speaking. You can interrupt by talking.
+              </div>
+            )}
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div className="mt-6 rounded-2xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/20 p-4">
+              <div className="flex items-center gap-2 text-red-500 mb-2">
+                <AlertCircle size={18} />
+                <h3 className="font-semibold">Error</h3>
+              </div>
+              <p className="text-sm text-red-500 whitespace-pre-wrap break-words">{error}</p>
+            </div>
+          )}
+
+          {/* Transcript */}
+          <div className="mt-8 space-y-4">
+            {turns.length === 0 ? (
+              <div className="flex flex-col items-center justify-center text-center text-sm text-[var(--text-secondary)] border border-dashed border-[var(--border-color)] rounded-2xl p-10">
+                <div className="w-12 h-12 rounded-2xl bg-[var(--bg-tertiary)] flex items-center justify-center mb-3 text-[var(--accent)]">
+                  <Sparkles size={22} />
+                </div>
+                Your voice conversation transcript will appear here.
+              </div>
+            ) : (
+              turns.map((turn) => (
+                <div
+                  key={turn.id}
+                  className="rounded-2xl border border-[var(--border-color)] bg-[var(--bg-secondary)] p-4 sm:p-5 shadow-sm message-animate"
+                >
+                  {/* User */}
+                  <div className="mb-4">
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className="w-6 h-6 rounded-md bg-[var(--bg-tertiary)] flex items-center justify-center text-[var(--text-secondary)]">
+                        <User size={13} />
+                      </span>
+                      <p className="text-xs font-medium uppercase tracking-wide text-[var(--text-secondary)]">
+                        You said
+                      </p>
+                    </div>
+                    <p className="text-[var(--text-primary)] pl-8">
+                      {turn.user || 'Transcript unavailable.'}
+                    </p>
+                  </div>
+
+                  {/* Assistant */}
+                  <div className="pt-4 border-t border-[var(--border-color)]">
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className="w-6 h-6 rounded-md bg-[var(--accent)]/10 flex items-center justify-center text-[var(--accent)]">
+                        <Sparkles size={13} />
+                      </span>
+                      <p className="text-xs font-medium uppercase tracking-wide text-[var(--text-secondary)]">
+                        Assistant
+                      </p>
+                    </div>
+                    <p className="text-[var(--text-primary)] whitespace-pre-wrap pl-8">
+                      {turn.assistant || 'No answer returned.'}
+                    </p>
+                  </div>
+
+                  {/* Meta */}
+                  {(turn.provider || turn.model || turn.ttsProvider || turn.language) && (
+                    <div className="mt-3.5 pl-8 flex flex-wrap gap-1.5">
+                      {turn.provider && (
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                          {turn.provider}
+                        </span>
+                      )}
+                      {turn.model && (
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                          {turn.model}
+                        </span>
+                      )}
+                      {turn.ttsProvider && (
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                          TTS: {turn.ttsProvider}
+                        </span>
+                      )}
+                      {turn.language && (
+                        <span className="text-[11px] px-2 py-0.5 rounded-md bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                          {turn.language}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))
             )}
           </div>
         </div>

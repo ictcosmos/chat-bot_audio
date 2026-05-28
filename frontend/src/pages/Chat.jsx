@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { Upload, X, Database, HardDrive } from 'lucide-react'
+import { Upload, X, Database, HardDrive, FileText } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
 import ChatInput from '../components/ChatInput'
@@ -24,6 +24,8 @@ export default function Chat({ user }) {
   const [showFileUpload, setShowFileUpload] = useState(false)
   const [showDrivePicker, setShowDrivePicker] = useState(false)
   const [fileRefreshKey, setFileRefreshKey] = useState(0)
+
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -181,6 +183,7 @@ export default function Chat({ user }) {
       setSelectedFileIds([])
       setShowFileUpload(false)
       setShowDrivePicker(false)
+      setSidebarOpen(false)
     } catch (err) {
       console.error('Failed to create chat:', err)
     } finally {
@@ -196,6 +199,7 @@ export default function Chat({ user }) {
     setSelectedFileIds([])
     setShowFileUpload(false)
     setShowDrivePicker(false)
+    setSidebarOpen(false)
   }
 
   const handleDeleteChat = async (chatId) => {
@@ -357,6 +361,7 @@ export default function Chat({ user }) {
             id: `local_error_${Date.now()}`,
             role: 'assistant',
             content: errorText,
+            isError: true,
           },
         ])
       } finally {
@@ -389,158 +394,211 @@ export default function Chat({ user }) {
   const activeChatTitle =
     chats.find((chat) => chat.id === activeChatId)?.title || 'New Chat'
 
+  const attachmentPanelOpen = showFileUpload || showDrivePicker
+
   return (
-    <div className="h-screen flex bg-[var(--bg-primary)] text-[var(--text-primary)]">
-      <ChatSidebar
-        chats={chats}
-        activeChatId={activeChatId}
-        onSelectChat={handleSelectChat}
-        onNewChat={handleNewChat}
-        onDeleteChat={handleDeleteChat}
-        onRenameChat={handleRenameChat}
-        onSearch={handleSearch}
-        darkMode={darkMode}
-        toggleDarkMode={() => setDarkMode((prev) => !prev)}
-      />
+    <div className="h-screen flex bg-[var(--bg-primary)] text-[var(--text-primary)] overflow-hidden">
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Sidebar: drawer on mobile, static on desktop */}
+      <div
+        className={`fixed inset-y-0 left-0 z-40 transition-transform duration-300 ease-out md:static md:z-auto md:translate-x-0 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
+      >
+        <ChatSidebar
+          chats={chats}
+          activeChatId={activeChatId}
+          onSelectChat={handleSelectChat}
+          onNewChat={handleNewChat}
+          onDeleteChat={handleDeleteChat}
+          onRenameChat={handleRenameChat}
+          onSearch={handleSearch}
+          darkMode={darkMode}
+          toggleDarkMode={() => setDarkMode((prev) => !prev)}
+          onClose={() => setSidebarOpen(false)}
+        />
+      </div>
 
       <main className="flex-1 flex flex-col min-w-0">
-        <div className="border-b border-[var(--border-color)] bg-[var(--bg-secondary)] px-4 py-3">
-          <div className="min-w-0">
+        {/* Header */}
+        <header className="flex items-center gap-3 border-b border-[var(--border-color)] bg-[var(--bg-secondary)]/80 backdrop-blur-sm px-4 py-3">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            className="md:hidden p-2 -ml-1 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)] transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+            title="Open sidebar"
+            aria-label="Open sidebar"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="3" y1="6" x2="21" y2="6" />
+              <line x1="3" y1="12" x2="21" y2="12" />
+              <line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
+
+          <div className="min-w-0 flex-1">
             <h1 className="text-sm font-semibold text-[var(--text-primary)] truncate">
               {activeChatTitle}
             </h1>
-            <p className="text-xs text-[var(--text-secondary)]">
+            <p className="text-xs text-[var(--text-secondary)] truncate">
               Ask normally, use current search, or attach documents for RAG.
             </p>
           </div>
-        </div>
+
+          {selectedFileIds.length > 0 && (
+            <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--accent)]/10 text-[var(--accent)] text-xs font-medium whitespace-nowrap">
+              <FileText size={12} />
+              {selectedFileIds.length} doc{selectedFileIds.length > 1 ? 's' : ''}
+            </span>
+          )}
+        </header>
 
         <ChatWindow messages={messages} isLoading={isLoading} />
 
-        <div className="border-t border-[var(--border-color)] bg-[var(--bg-secondary)] p-4">
-          {(showFileUpload || showDrivePicker) && (
-            <div className="mb-4 rounded-2xl border border-[var(--border-color)] bg-[var(--bg-primary)] p-4 shadow-sm">
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">
-                    Attach documents
-                  </h3>
-                  <p className="text-xs text-[var(--text-secondary)]">
-                    Upload local files or import from Drive, then select them for document chat.
-                  </p>
+        {/* Composer area */}
+        <div className="border-t border-[var(--border-color)] bg-[var(--bg-secondary)] px-3 sm:px-4 py-3">
+          <div className="mx-auto w-full max-w-3xl">
+            {/* Attachment panel */}
+            <div
+              className={`grid transition-all duration-300 ease-out ${attachmentPanelOpen
+                  ? 'grid-rows-[1fr] opacity-100 mb-3'
+                  : 'grid-rows-[0fr] opacity-0'
+                }`}
+            >
+              <div className="overflow-hidden">
+                <div className="rounded-2xl border border-[var(--border-color)] bg-[var(--bg-primary)] p-4 shadow-sm">
+                  <div className="flex items-start justify-between mb-3 gap-3">
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                        Attach documents
+                      </h3>
+                      <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                        Upload local files or import from Drive, then select them for document chat.
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowFileUpload(false)
+                        setShowDrivePicker(false)
+                      }}
+                      className="p-2 -mt-1 -mr-1 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)] transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                      title="Close attachment panel"
+                      aria-label="Close attachment panel"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div className="mb-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowFileUpload(true)
+                        setShowDrivePicker(false)
+                      }}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)] ${showFileUpload
+                          ? 'bg-[var(--accent)] text-white'
+                          : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                    >
+                      <HardDrive size={16} />
+                      Local Upload
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowDrivePicker(true)
+                        setShowFileUpload(false)
+                      }}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)] ${showDrivePicker
+                          ? 'bg-[var(--accent)] text-white'
+                          : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                    >
+                      <Database size={16} />
+                      Google Drive
+                    </button>
+                  </div>
+
+                  {showFileUpload && (
+                    <FileUpload
+                      chatId={activeChatId}
+                      ensureChat={ensureChatExists}
+                      onFileUploaded={handleFileUpload}
+                    />
+                  )}
+
+                  {showDrivePicker && (
+                    <GoogleDrivePicker
+                      chatId={activeChatId}
+                      onFileImported={handleDriveImported}
+                    />
+                  )}
                 </div>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowFileUpload(false)
-                    setShowDrivePicker(false)
-                  }}
-                  className="p-2 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
-                  title="Close attachment panel"
-                >
-                  <X size={16} />
-                </button>
               </div>
+            </div>
 
-              <div className="mb-3 flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowFileUpload(true)
-                    setShowDrivePicker(false)
-                  }}
-                  className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${showFileUpload
-                      ? 'bg-[var(--accent)] text-white'
-                      : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                >
-                  <HardDrive size={16} />
-                  Local Upload
-                </button>
+            {/* Quick actions row */}
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowFileUpload((prev) => !prev)
+                  setShowDrivePicker(false)
+                }}
+                className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)] ${showFileUpload
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]'
+                  }`}
+              >
+                <Upload size={16} />
+                Attach
+              </button>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowDrivePicker(true)
-                    setShowFileUpload(false)
-                  }}
-                  className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${showDrivePicker
-                      ? 'bg-[var(--accent)] text-white'
-                      : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                >
-                  <Database size={16} />
-                  Google Drive
-                </button>
-              </div>
+              <FileSelector
+                selectedFileIds={selectedFileIds}
+                onSelectionChange={setSelectedFileIds}
+                refreshKey={fileRefreshKey}
+              />
 
-              {showFileUpload && (
-                <FileUpload
-                  chatId={activeChatId}
-                  ensureChat={ensureChatExists}
-                  onFileUploaded={handleFileUpload}
-                />
+              {selectedFileIds.length > 0 && (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--accent)]/10 text-[var(--accent)] text-xs font-medium">
+                  <FileText size={12} />
+                  {selectedFileIds.length} document{selectedFileIds.length > 1 ? 's' : ''} selected
+                </span>
               )}
 
-              {showDrivePicker && (
-                <GoogleDrivePicker
-                  chatId={activeChatId}
-                  onFileImported={handleDriveImported}
-                />
+              {selectedFileIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedFileIds([])}
+                  className="text-xs px-2.5 py-1 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)] transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                >
+                  Clear
+                </button>
               )}
             </div>
-          )}
 
-          <div className="mb-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
+            <ChatInput
+              onSend={handleSend}
+              onFileClick={() => {
                 setShowFileUpload((prev) => !prev)
                 setShowDrivePicker(false)
               }}
-              className={`flex items-center gap-2 px-4 py-2 text-sm rounded-lg transition-colors ${showFileUpload
-                  ? 'bg-[var(--accent)] text-white'
-                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'
-                }`}
-            >
-              <Upload size={16} />
-              Attach New File
-            </button>
-
-            <FileSelector
-              selectedFileIds={selectedFileIds}
-              onSelectionChange={setSelectedFileIds}
-              refreshKey={fileRefreshKey}
+              onVoiceClick={() => navigate('/voice')}
+              disabled={isLoading}
             />
-
-            {selectedFileIds.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setSelectedFileIds([])}
-                className="text-xs px-3 py-2 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
-              >
-                Clear selected files
-              </button>
-            )}
-
-            {selectedFileIds.length > 0 && (
-              <span className="text-xs text-[var(--text-secondary)]">
-                {selectedFileIds.length} document
-                {selectedFileIds.length > 1 ? 's' : ''} selected
-              </span>
-            )}
           </div>
-
-          <ChatInput
-            onSend={handleSend}
-            onFileClick={() => {
-              setShowFileUpload((prev) => !prev)
-              setShowDrivePicker(false)
-            }}
-            onVoiceClick={() => navigate('/voice')}
-            disabled={isLoading}
-          />
         </div>
       </main>
     </div>

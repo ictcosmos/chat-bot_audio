@@ -1,11 +1,13 @@
 import base64
 import os
+import subprocess
 import tempfile
 import threading
 from typing import Optional
 
 import numpy as np
 import soundfile as sf
+import torch
 from faster_whisper import WhisperModel
 from groq import Groq
 from gtts import gTTS
@@ -18,6 +20,12 @@ try:
 except Exception:
     KPipeline = None
 
+try:
+    from silero_vad import load_silero_vad, get_speech_timestamps
+except Exception:
+    load_silero_vad = None
+    get_speech_timestamps = None
+
 
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
 
@@ -27,19 +35,65 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
+# Strict Silero VAD settings to reduce Whisper hallucination.
+# If real speech is being missed, lower threshold to 0.60 or 0.65.
+# If hallucination still happens, increase threshold to 0.80 or 0.85.
+SILERO_VAD_THRESHOLD = float(os.getenv("SILERO_VAD_THRESHOLD", "0.72"))
+SILERO_MIN_SPEECH_MS = int(os.getenv("SILERO_MIN_SPEECH_MS", "600"))
+SILERO_MIN_SILENCE_MS = int(os.getenv("SILERO_MIN_SILENCE_MS", "900"))
+SILERO_SPEECH_PAD_MS = int(os.getenv("SILERO_SPEECH_PAD_MS", "80"))
+SILERO_MIN_TOTAL_SPEECH_MS = int(os.getenv("SILERO_MIN_TOTAL_SPEECH_MS", "900"))
+SILERO_MIN_AUDIO_MS = int(os.getenv("SILERO_MIN_AUDIO_MS", "700"))
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 _whisper_model = None
 _kokoro_pipeline = None
+_silero_model = None
 
 _whisper_lock = threading.Lock()
 _kokoro_lock = threading.Lock()
+_silero_lock = threading.Lock()
 
 _voice_loading_status = {
+    "silero_loading": False,
     "whisper_loading": False,
     "kokoro_loading": False,
     "last_error": "",
 }
+
+
+def get_silero_model():
+    global _silero_model
+
+    if _silero_model is not None:
+        return _silero_model
+
+    with _silero_lock:
+        if _silero_model is not None:
+            return _silero_model
+
+        if load_silero_vad is None:
+            raise RuntimeError(
+                "Silero VAD is not installed correctly. Run: pip install silero-vad"
+            )
+
+        try:
+            _voice_loading_status["silero_loading"] = True
+            _voice_loading_status["last_error"] = ""
+
+            print("[Voice] Loading Silero VAD...")
+            _silero_model = load_silero_vad()
+            print("[Voice] Silero VAD loaded.")
+
+            return _silero_model
+
+        except Exception as exc:
+            _voice_loading_status["last_error"] = str(exc)
+            raise
+
+        finally:
+            _voice_loading_status["silero_loading"] = False
 
 
 def get_whisper_model():
@@ -111,6 +165,10 @@ def get_kokoro_pipeline():
             _voice_loading_status["kokoro_loading"] = False
 
 
+def is_silero_loaded() -> bool:
+    return _silero_model is not None
+
+
 def is_whisper_loaded() -> bool:
     return _whisper_model is not None
 
@@ -121,8 +179,10 @@ def is_kokoro_loaded() -> bool:
 
 def get_voice_model_status() -> dict:
     return {
+        "silero_loaded": is_silero_loaded(),
         "whisper_loaded": is_whisper_loaded(),
         "kokoro_loaded": is_kokoro_loaded(),
+        "silero_loading": _voice_loading_status["silero_loading"],
         "whisper_loading": _voice_loading_status["whisper_loading"],
         "kokoro_loading": _voice_loading_status["kokoro_loading"],
         "last_error": _voice_loading_status["last_error"],
@@ -130,10 +190,14 @@ def get_voice_model_status() -> dict:
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,
         "kokoro_voice": KOKORO_VOICE,
+        "silero_threshold": SILERO_VAD_THRESHOLD,
+        "silero_min_speech_ms": SILERO_MIN_SPEECH_MS,
+        "silero_min_total_speech_ms": SILERO_MIN_TOTAL_SPEECH_MS,
     }
 
 
 def preload_voice_models() -> dict:
+    get_silero_model()
     get_whisper_model()
 
     kokoro_loaded = False
@@ -145,17 +209,7 @@ def preload_voice_models() -> dict:
         print(f"[Voice] Kokoro preload failed: {exc}")
         _voice_loading_status["last_error"] = str(exc)
 
-    return {
-        "whisper_loaded": is_whisper_loaded(),
-        "kokoro_loaded": kokoro_loaded,
-        "whisper_loading": _voice_loading_status["whisper_loading"],
-        "kokoro_loading": _voice_loading_status["kokoro_loading"],
-        "last_error": _voice_loading_status["last_error"],
-        "whisper_model": WHISPER_MODEL_SIZE,
-        "whisper_device": WHISPER_DEVICE,
-        "whisper_compute_type": WHISPER_COMPUTE_TYPE,
-        "kokoro_voice": KOKORO_VOICE,
-    }
+    return get_voice_model_status()
 
 
 def _extension_from_mime(mime_type: str) -> str:
@@ -189,14 +243,6 @@ def detect_language(text: str) -> str:
 
 
 def detect_requested_reply_language(transcript: str, detected_language: str = "en") -> str:
-    """
-    Decide output language.
-
-    Priority:
-    1. Explicit instruction from user.
-    2. Detected spoken/input language.
-    """
-
     text = (transcript or "").lower()
 
     nepali_requests = [
@@ -238,6 +284,189 @@ def detect_requested_reply_language(transcript: str, detected_language: str = "e
     return detected_language if detected_language in {"en", "ne"} else "en"
 
 
+def convert_audio_to_16k_wav(input_path: str) -> str:
+    """
+    Convert webm/mp3/m4a/etc. to mono 16k wav using ffmpeg.
+    This avoids torchaudio/torchcodec dependency for Silero audio I/O.
+    """
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        output_path,
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        try:
+            os.remove(output_path)
+        except Exception:
+            pass
+
+        raise RuntimeError(f"ffmpeg audio conversion failed: {result.stderr}")
+
+    return output_path
+
+
+def load_wav_for_silero(wav_path: str):
+    """
+    Load wav using soundfile instead of torchaudio.
+    Returns torch tensor expected by Silero.
+    """
+    audio, sample_rate = sf.read(wav_path, dtype="float32")
+
+    if sample_rate != 16000:
+        raise RuntimeError(f"Expected 16000 Hz after ffmpeg conversion, got {sample_rate}")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    return torch.from_numpy(audio)
+
+
+def detect_speech_with_silero(audio_path: str) -> dict:
+    """
+    Strict backend VAD check using Silero.
+
+    This prevents Whisper hallucination by rejecting:
+    - pure silence
+    - very short sounds
+    - clicks/noise
+    - tiny speech fragments
+    """
+    if get_speech_timestamps is None:
+        raise RuntimeError("Silero VAD is not installed correctly.")
+
+    model = get_silero_model()
+    wav_path = None
+
+    try:
+        wav_path = convert_audio_to_16k_wav(audio_path)
+        wav = load_wav_for_silero(wav_path)
+
+        audio_duration_ms = round((len(wav) / 16000) * 1000, 2)
+
+        if audio_duration_ms < SILERO_MIN_AUDIO_MS:
+            return {
+                "has_speech": False,
+                "reason": "audio_too_short",
+                "audio_duration_ms": audio_duration_ms,
+                "speech_timestamps": [],
+                "speech_ms": 0,
+                "threshold": SILERO_VAD_THRESHOLD,
+            }
+
+        speech_timestamps = get_speech_timestamps(
+            wav,
+            model,
+            sampling_rate=16000,
+            threshold=SILERO_VAD_THRESHOLD,
+            min_speech_duration_ms=SILERO_MIN_SPEECH_MS,
+            min_silence_duration_ms=SILERO_MIN_SILENCE_MS,
+            speech_pad_ms=SILERO_SPEECH_PAD_MS,
+        )
+
+        total_speech_ms = 0
+
+        for item in speech_timestamps:
+            start = item.get("start", 0)
+            end = item.get("end", 0)
+            total_speech_ms += max(0, end - start) / 16
+
+        total_speech_ms = round(total_speech_ms, 2)
+
+        if not speech_timestamps:
+            return {
+                "has_speech": False,
+                "reason": "no_speech_detected",
+                "audio_duration_ms": audio_duration_ms,
+                "speech_timestamps": [],
+                "speech_ms": total_speech_ms,
+                "threshold": SILERO_VAD_THRESHOLD,
+            }
+
+        if total_speech_ms < SILERO_MIN_TOTAL_SPEECH_MS:
+            return {
+                "has_speech": False,
+                "reason": "speech_too_short",
+                "audio_duration_ms": audio_duration_ms,
+                "speech_timestamps": speech_timestamps,
+                "speech_ms": total_speech_ms,
+                "threshold": SILERO_VAD_THRESHOLD,
+            }
+
+        return {
+            "has_speech": True,
+            "reason": "speech_detected",
+            "audio_duration_ms": audio_duration_ms,
+            "speech_timestamps": speech_timestamps,
+            "speech_ms": total_speech_ms,
+            "threshold": SILERO_VAD_THRESHOLD,
+        }
+
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+
+def _is_likely_whisper_hallucination(transcript: str) -> bool:
+    if not transcript:
+        return True
+
+    cleaned = transcript.lower().strip()
+    cleaned = cleaned.strip(".!?,-–— ")
+
+    if len(cleaned) < 3:
+        return True
+
+    bad_hallucinations = {
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "subscribe",
+        "like and subscribe",
+        "bye",
+        "goodbye",
+        "you",
+        "okay",
+        "ok",
+        "hmm",
+        "um",
+        "uh",
+        "music",
+        "background music",
+    }
+
+    if cleaned in bad_hallucinations:
+        return True
+
+    # Repeated hallucination-like text
+    words = cleaned.split()
+    if len(words) >= 4 and len(set(words)) <= 2:
+        return True
+
+    return False
+
+
 def transcribe_audio_with_faster_whisper(
     audio_data: bytes,
     mime_type: str = "audio/webm",
@@ -253,14 +482,34 @@ def transcribe_audio_with_faster_whisper(
             temp_file.write(audio_data)
             temp_path = temp_file.name
 
+        vad_result = detect_speech_with_silero(temp_path)
+
+        if not vad_result.get("has_speech"):
+            return {
+                "transcript": "",
+                "language": "en",
+                "input_language": "en",
+                "detected_language_raw": "",
+                "model": WHISPER_MODEL_SIZE,
+                "no_speech": True,
+                "vad": vad_result,
+            }
+
         model = get_whisper_model()
 
         segments, info = model.transcribe(
             temp_path,
             beam_size=5,
             vad_filter=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.75,
+            log_prob_threshold=-0.7,
+            compression_ratio_threshold=2.4,
             vad_parameters={
-                "min_silence_duration_ms": 500,
+                "threshold": SILERO_VAD_THRESHOLD,
+                "min_speech_duration_ms": SILERO_MIN_SPEECH_MS,
+                "min_silence_duration_ms": SILERO_MIN_SILENCE_MS,
+                "speech_pad_ms": SILERO_SPEECH_PAD_MS,
             },
         )
 
@@ -271,6 +520,21 @@ def transcribe_audio_with_faster_whisper(
                 transcript_parts.append(segment.text.strip())
 
         transcript = " ".join(transcript_parts).strip()
+
+        if _is_likely_whisper_hallucination(transcript):
+            return {
+                "transcript": "",
+                "language": "en",
+                "input_language": "en",
+                "detected_language_raw": "",
+                "model": WHISPER_MODEL_SIZE,
+                "no_speech": True,
+                "vad": {
+                    **vad_result,
+                    "reason": "likely_whisper_hallucination",
+                    "hallucinated_text": transcript,
+                },
+            }
 
         raw_lang = getattr(info, "language", None) or ""
         local_lang = detect_language(transcript)
@@ -292,6 +556,8 @@ def transcribe_audio_with_faster_whisper(
             "input_language": detected_lang,
             "detected_language_raw": raw_lang,
             "model": WHISPER_MODEL_SIZE,
+            "no_speech": False,
+            "vad": vad_result,
         }
 
     finally:
@@ -570,6 +836,26 @@ def process_voice_audio(
 ) -> dict:
     transcription_result = transcribe_audio_with_faster_whisper(audio_data, mime_type)
 
+    if transcription_result.get("no_speech"):
+        return {
+            "transcript": "",
+            "answer": "",
+            "language": "en",
+            "input_language": "en",
+            "provider": "",
+            "route": "voice_no_speech",
+            "stt_provider": "faster-whisper",
+            "stt_model": transcription_result.get("model", WHISPER_MODEL_SIZE),
+            "detected_language_raw": "",
+            "model": "",
+            "token_usage": {},
+            "audio_base64": "",
+            "audio_mime_type": "",
+            "tts_provider": "",
+            "vad": transcription_result.get("vad", {}),
+            "no_speech": True,
+        }
+
     transcript = transcription_result.get("transcript", "")
     output_language = transcription_result.get("language", "en")
     input_language = transcription_result.get("input_language", output_language)
@@ -594,4 +880,6 @@ def process_voice_audio(
         "audio_base64": tts_result.get("audio_base64", ""),
         "audio_mime_type": tts_result.get("audio_mime_type", ""),
         "tts_provider": tts_result.get("tts_provider", ""),
+        "vad": transcription_result.get("vad", {}),
+        "no_speech": False,
     }

@@ -36,6 +36,7 @@ def build_voice_trace(result: dict | None = None) -> dict:
     return {
         "route": result.get("route", "voice"),
         "stt_provider": "faster-whisper",
+        "vad_provider": "silero",
         "input_language": result.get("input_language", ""),
         "output_language": result.get("language", ""),
         "reasoning_provider": result.get("provider", ""),
@@ -108,6 +109,7 @@ async def transcribe_audio(
                 "provider": result.get("stt_provider", "faster-whisper"),
                 "model": result.get("stt_model", ""),
                 "input_language": input_lang,
+                "vad": result.get("vad", {}),
             },
         )
 
@@ -148,6 +150,8 @@ async def transcribe_audio(
         "audio_mime_type": result.get("audio_mime_type", ""),
         "trace": build_voice_trace(result),
         "token_usage": token_usage,
+        "no_speech": result.get("no_speech", False),
+        "vad": result.get("vad", {}),
     }
 
 
